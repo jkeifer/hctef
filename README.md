@@ -222,3 +222,7 @@ pre-commit run --all-files
 ## License
 
 Apache License 2.0
+
+## What is hctef?
+
+Fetch spelled backwards, of course!
