@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 try:
     import aiohttp
@@ -72,7 +72,7 @@ class _OpenedAsyncHttpFile:
         Returns:
             Fully initialized _OpenedAsyncHttpFile instance
         """
-        session = aiohttp.ClientSession()
+        session = aiohttp.ClientSession(**http_file._session_args)
         size = await cls._get_file_size(session, http_file.url)
         return cls(http_file, session, size)
 
@@ -291,6 +291,7 @@ class AsyncHttpFile:
         minimum_range_request_bytes: int = 8192,
         prefetch_bytes: int = 2**20,
         prefetch_direction: Literal['START', 'END'] = 'END',
+        session_kwargs: dict[str, Any] | None = None,
     ) -> None:
         """
         Initialize async HTTP file wrapper.
@@ -318,6 +319,7 @@ class AsyncHttpFile:
         self._prefetch_direction = prefetch_direction
         self._minimum_range_request_bytes = minimum_range_request_bytes
         self._cursor: AsyncHttpFileCursor | None = None
+        self._session_args = session_kwargs if session_kwargs else {}
 
     @property
     def cursor(self) -> AsyncHttpFileCursor:
