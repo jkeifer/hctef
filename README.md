@@ -19,8 +19,9 @@ asynchronous operations.
   `seek()`, and `tell()` methods
 - **Efficient Range Requests**: Fetches only the data you need using HTTP Range
   headers
-- **Intelligent Caching**: Uses an interval tree to track cached byte ranges
-  and minimize redundant requests
+- **Disk-backed block cache**: Caches fixed-size blocks on disk and leans on the
+  OS page cache for the in-memory tier, so no file data is held in Python beyond
+  transient buffers. The cache persists across processes and survives restarts
 - **Prefetching**: Optionally prefetch data from the start or end of the file
 - **Sync and Async**: Both synchronous and asynchronous implementations
   available
@@ -132,18 +133,50 @@ Both `HttpFile` and `AsyncHttpFile` accept the following parameters:
 ```python
 HttpFile(
     url,
-    minimum_range_request_bytes=8192,  # Minimum bytes per request (default: 8KB)
-    prefetch_bytes=1048576,             # Bytes to prefetch on open (default: 1MB)
-    prefetch_direction='END'            # 'START' or 'END' (default: 'END')
+    prefetch_bytes=1048576,   # Bytes to prefetch on open (default: 1 MiB)
+    prefetch_direction='END', # 'START' or 'END' (default: 'END')
+    cache_dir=None,           # Where to store the block cache (default: temp dir)
+    block_size=None,          # Fixed block size in bytes (default: 1 MiB)
+    max_bytes=None,           # Optional cap on the whole cache dir (LRU eviction)
+    immutable=None,           # Skip etag/last-modified validation
 )
 ```
 
-- **`minimum_range_request_bytes`**: The minimum number of bytes to request in
-  a single HTTP Range request (except when filling small cache gaps)
 - **`prefetch_bytes`**: How many bytes to fetch immediately when opening the
   file. Set to 0 to disable prefetching
 - **`prefetch_direction`**: Whether to prefetch from the start (`'START'`) or
   end (`'END'`) of the file
+- **`cache_dir`**: Directory holding the disk block cache. When omitted, a
+  per-process temporary directory is created and removed on close
+- **`block_size`**: Fixed cache block size. All reads are serviced by fetching
+  and storing whole blocks; this subsumes the old request-coalescing knob
+- **`max_bytes`**: Optional size cap over the entire `cache_dir`. When exceeded,
+  least-recently-used blocks are evicted at write time
+- **`immutable`**: Trust an existing cache without revalidating `ETag` /
+  `Last-Modified` against the live response
+
+> **Note:** `minimum_range_request_bytes` is deprecated and ignored (it emits a
+> `DeprecationWarning`); `block_size` replaces it.
+
+### Environment variables
+
+When the corresponding constructor argument is not given, configuration falls
+back to these environment variables:
+
+| Variable | Meaning |
+| --- | --- |
+| `HCTEF_CACHE_DIR` | Cache directory (else a temp dir is used) |
+| `HCTEF_CACHE_BLOCK_BYTES` | Block size in bytes (default 1 MiB) |
+| `HCTEF_CACHE_MAX_BYTES` | Cap for the whole cache dir (default: unbounded) |
+| `HCTEF_CACHE_IMMUTABLE` | Truthy value (`1`/`true`/`yes`/`on`) to skip validation |
+
+Precedence is: explicit constructor argument, then environment variable, then
+the built-in default.
+
+> **tmpfs caveat:** On Linux the default temporary directory (`/tmp`) is often a
+> `tmpfs` mount backed by RAM. In that case the "disk" block cache actually
+> lives in memory, defeating the goal of keeping bytes out of RAM. Set
+> `cache_dir` / `HCTEF_CACHE_DIR` to a path on real disk when that matters.
 
 ## Requirements
 
@@ -156,17 +189,18 @@ HttpFile(
 When you open an HTTP file, `hctef`:
 
 1. Sends an initial Range request to determine the file size and verify Range
-   support
+   support, capturing `ETag` / `Last-Modified` validators
+1. Opens (or validates and, on mismatch, wipes) a per-URL directory under the
+   cache dir, keyed by `sha256(url)`, holding a `meta.json` and one file per
+   fixed-size block
 1. Optionally prefetches data from the start or end of the file
-1. Maintains an in-memory cache of fetched byte ranges (not suitable for
-   downloading complete large files)
-1. On `read()`, checks the cache first and only fetches missing data from the
-   server
-1. Combines multiple small requests into larger ones based on
-   `minimum_range_request_bytes`
+1. On `read()`, maps the request to a block range, fetches only the missing
+   blocks (coalescing contiguous gaps into single Range requests), writes each
+   block atomically, and assembles the result by reading the block files
 
-This approach minimizes HTTP requests while providing efficient random access
-to remote files.
+Because blocks live on disk and are read back through the OS page cache, hot
+data stays fast without being pinned in Python memory, and the cache is reused
+by later opens and other processes sharing the same directory.
 
 ## Error Handling
 
@@ -214,10 +248,8 @@ pre-commit run --all-files
 
 ## Future Ideas
 
-- Consoldiate sync/async implementations
-- Allow uncached "cursor" for reading a large file segement
-- Cursors with separate caches (to allow clearing memory when done)
-  - would allow cursor-based access with non-async implementation
+- Allow uncached "cursor" for reading a large file segment
+- Optional integrity checks on cached blocks
 
 ## License
 
