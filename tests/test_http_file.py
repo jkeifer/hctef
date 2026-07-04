@@ -9,7 +9,7 @@ from hctef import HttpFile
 def test_http_file(parquet_url: str) -> None:
     with HttpFile(
         parquet_url,
-        minimum_range_request_bytes=80,
+        block_size=80,
         prefetch_bytes=100,
     ) as hf:
         # Test initial state

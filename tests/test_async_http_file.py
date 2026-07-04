@@ -11,7 +11,7 @@ from hctef.aio import AsyncHttpFile
 async def test_async_http_file_basic(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=80,
+        block_size=80,
         prefetch_bytes=100,
     ) as hf:
         # Test initial state
@@ -68,7 +68,7 @@ async def test_async_http_file_basic(parquet_url: str) -> None:
 async def test_concurrent_reads_same_range(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=100,
+        block_size=100,
         prefetch_bytes=0,  # Disable prefetch to control exactly what's fetched
     ) as hf:
         # Create cursors for concurrent reads
@@ -87,12 +87,9 @@ async def test_concurrent_reads_same_range(parquet_url: str) -> None:
         assert results[0] == results[1] == results[2]
         assert len(results[0]) == 100
 
-        # Verify cache has the data
+        # Verify the block covering the range was persisted to disk
         cache = hf.cursor.ohf.cache
-        cached_intervals = list(cache.cache.find_overlapping(0, 100))
-        assert len(cached_intervals) > 0
-        # Should be bytes, not a Task anymore
-        assert isinstance(cached_intervals[0].data, bytes)
+        assert cache._block_path(0).exists()
 
 
 @pytest.mark.asyncio
@@ -100,7 +97,7 @@ async def test_concurrent_reads_same_range(parquet_url: str) -> None:
 async def test_concurrent_reads_different_ranges(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=50,
+        block_size=50,
         prefetch_bytes=0,
     ) as hf:
         # Create cursors for concurrent reads
@@ -135,7 +132,7 @@ async def test_concurrent_reads_different_ranges(parquet_url: str) -> None:
 async def test_overlapping_concurrent_reads(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=50,
+        block_size=50,
         prefetch_bytes=0,
     ) as hf:
         # First read to populate cache
@@ -194,7 +191,7 @@ async def test_read_without_open_raises(parquet_url: str) -> None:
 async def test_cache_deduplication_under_load(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=50,
+        block_size=50,
         prefetch_bytes=0,
     ) as hf:
         # Create many cursors for concurrent reads of the same range
@@ -209,11 +206,9 @@ async def test_cache_deduplication_under_load(parquet_url: str) -> None:
         assert all(r == results[0] for r in results)
         assert len(results[0]) == 100
 
-        # Verify cache has the data and it's bytes (not a Task)
+        # Verify the block covering the range was persisted to disk
         cache = hf.cursor.ohf.cache
-        cached_intervals = list(cache.cache.find_overlapping(0, 100))
-        assert len(cached_intervals) > 0
-        assert isinstance(cached_intervals[0].data, bytes)
+        assert cache._block_path(0).exists()
 
 
 @pytest.mark.asyncio
@@ -221,7 +216,7 @@ async def test_cache_deduplication_under_load(parquet_url: str) -> None:
 async def test_clone_user_after_close(parquet_url: str) -> None:
     async with AsyncHttpFile(
         parquet_url,
-        minimum_range_request_bytes=50,
+        block_size=50,
         prefetch_bytes=0,
     ) as hf:
         cursor = hf.clone()
