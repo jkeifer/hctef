@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import urllib.request
+import warnings
 
 from typing import Literal, Self
 
+from .block_cache import BlockCache
 from .exceptions import HctefNetworkError, HctefUrlError
-from .file_read_cache import FileReadCache
 
 
 def _check_url(url: str) -> None:
@@ -43,18 +44,19 @@ class _OpenedHttpFile:
 
         self.http_file = http_file
         self._position = 0
+        self._etag: str | None = None
+        self._last_modified: str | None = None
         self._size = self._get_file_size()
-        self._minimum_range_request_bytes = min(
-            self.http_file._minimum_range_request_bytes,
-            self._size,
-        )
-        self._cache = FileReadCache(
+        self._cache = BlockCache(
+            self.http_file.url,
             self._size,
             self._fetch_range,
-            minimum_request_size=min(
-                self.http_file._minimum_range_request_bytes,
-                self._size,
-            ),
+            etag=self._etag,
+            last_modified=self._last_modified,
+            cache_dir=self.http_file._cache_dir,
+            block_size=self.http_file._block_size,
+            max_bytes=self.http_file._max_bytes,
+            immutable=self.http_file._immutable,
         )
 
         prefetch_bytes = min(
@@ -83,6 +85,8 @@ class _OpenedHttpFile:
                 headers={'Range': 'bytes=0-'},
             )
             with urllib.request.urlopen(request) as response:  # noqa: S310
+                self._etag = response.headers.get('ETag')
+                self._last_modified = response.headers.get('Last-Modified')
                 content_range = response.headers.get('Content-Range')
                 if content_range:
                     return int(content_range.split('/')[-1])
@@ -172,9 +176,13 @@ class HttpFile:
     def __init__(
         self,
         url: str,
-        minimum_range_request_bytes: int = 8192,
         prefetch_bytes: int = 2**20,
         prefetch_direction: Literal['START', 'END'] = 'END',
+        cache_dir: str | None = None,
+        block_size: int | None = None,
+        max_bytes: int | None = None,
+        immutable: bool | None = None,
+        minimum_range_request_bytes: int | None = None,
     ) -> None:
         """
         Initialize HTTP file wrapper.
@@ -183,26 +191,49 @@ class HttpFile:
             url: HTTP/HTTPS URL for a file
 
         Keyword Args:
-            minimum_range_request_bytes:
-                Least number of bytes to request,
-                except when filling cache gaps
             prefetch_bytes:
                 How many bytes to request when initializing the class.
                 Set to 0 or less to disable prefetch. Default 1 MiB.
             prefetch_direction:
                 Whether to prefetch from file start or file end.
                 Possible values `START` or `END`.
+            cache_dir:
+                Directory for the disk-backed block cache. Falls back to
+                ``HCTEF_CACHE_DIR`` then a per-process temporary directory.
+            block_size:
+                Fixed block size in bytes. Falls back to
+                ``HCTEF_CACHE_BLOCK_BYTES`` then 1 MiB.
+            max_bytes:
+                Optional cap on the whole cache dir, enforced by LRU eviction.
+                Falls back to ``HCTEF_CACHE_MAX_BYTES``.
+            immutable:
+                Skip etag/last-modified validation. Falls back to
+                ``HCTEF_CACHE_IMMUTABLE``.
+            minimum_range_request_bytes:
+                Deprecated and ignored; ``block_size`` subsumes request
+                coalescing.
 
         Raises:
             HctefUrlError: If URL is invalid
             HctefNetworkError: If server doesn't support range requests
         """
 
+        if minimum_range_request_bytes is not None:
+            warnings.warn(
+                'minimum_range_request_bytes is deprecated and ignored; '
+                'use block_size instead',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         _check_url(url)
         self.url = url
         self._prefetch_bytes = prefetch_bytes
         self._prefetch_direction = prefetch_direction
-        self._minimum_range_request_bytes = minimum_range_request_bytes
+        self._cache_dir = cache_dir
+        self._block_size = block_size
+        self._max_bytes = max_bytes
+        self._immutable = immutable
         self._opened: _OpenedHttpFile | None = None
 
     @property
@@ -217,8 +248,10 @@ class HttpFile:
 
     def close(self) -> None:
         """
-        Close the file (clears cache).
+        Close the file, releasing any temporary cache directory.
         """
+        if self._opened is not None:
+            self._opened._cache.close()
         self._opened = None
 
     def __enter__(self) -> Self:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import warnings
 
 from typing import Any, Literal, Self
 
@@ -13,7 +13,7 @@ except ImportError:
 
 from hctef.exceptions import HctefNetworkError, HctefUrlError
 
-from .async_file_read_cache import AsyncFileReadCache
+from .async_block_cache import AsyncBlockCache
 
 
 def _check_url(url: str) -> None:
@@ -40,6 +40,8 @@ class _OpenedAsyncHttpFile:
         http_file: AsyncHttpFile,
         session: aiohttp.ClientSession,
         size: int,
+        etag: str | None = None,
+        last_modified: str | None = None,
     ) -> None:
         """
         Initialize opened HTTP file with pre-fetched async values.
@@ -48,17 +50,22 @@ class _OpenedAsyncHttpFile:
             http_file: The parent AsyncHttpFile instance
             session: Pre-created aiohttp session
             size: File size obtained via async HTTP request
+            etag: ETag response header, if any
+            last_modified: Last-Modified response header, if any
         """
         self.http_file = http_file
         self.session = session
         self.size = size
-        self.cache = AsyncFileReadCache(
+        self.cache = AsyncBlockCache(
+            http_file.url,
             self.size,
-            self._fetch_range,
-            minimum_request_size=min(
-                self.http_file._minimum_range_request_bytes,
-                self.size,
-            ),
+            self._do_fetch_range,
+            etag=etag,
+            last_modified=last_modified,
+            cache_dir=http_file._cache_dir,
+            block_size=http_file._block_size,
+            max_bytes=http_file._max_bytes,
+            immutable=http_file._immutable,
         )
 
     @classmethod
@@ -73,23 +80,23 @@ class _OpenedAsyncHttpFile:
             Fully initialized _OpenedAsyncHttpFile instance
         """
         session = aiohttp.ClientSession(**http_file._session_args)
-        size = await cls._get_file_size(session, http_file.url)
-        return cls(http_file, session, size)
+        size, etag, last_modified = await cls._get_file_size(session, http_file.url)
+        return cls(http_file, session, size, etag, last_modified)
 
     @staticmethod
     async def _get_file_size(
         session: aiohttp.ClientSession,
         url: str,
-    ) -> int:
+    ) -> tuple[int, str | None, str | None]:
         """
-        Get total file size using async HTTP range request.
+        Get total file size and validators using an async HTTP range request.
 
         Args:
             session: aiohttp session to use for request
             url: URL to fetch size for
 
         Returns:
-            File size in bytes
+            Tuple of (file size in bytes, ETag, Last-Modified)
 
         Raises:
             HctefNetworkError: If size cannot be determined
@@ -97,9 +104,11 @@ class _OpenedAsyncHttpFile:
         try:
             headers = {'Range': 'bytes=0-'}
             async with session.get(url, headers=headers) as response:
+                etag = response.headers.get('ETag')
+                last_modified = response.headers.get('Last-Modified')
                 content_range = response.headers.get('Content-Range')
                 if content_range:
-                    return int(content_range.split('/')[-1])
+                    return int(content_range.split('/')[-1]), etag, last_modified
 
                 # If no Content-Range header, server doesn't support ranges
                 raise HctefNetworkError(
@@ -109,19 +118,6 @@ class _OpenedAsyncHttpFile:
             raise HctefNetworkError(
                 f'Cannot determine file size for {url}',
             ) from e
-
-    def _fetch_range(self, start: int, end: int) -> asyncio.Task[bytes]:
-        """
-        Create an async task to fetch byte range using HTTP request.
-
-        Args:
-            start: Start byte position (inclusive)
-            end: End byte position (exclusive)
-
-        Returns:
-            Asyncio task that will fetch the requested bytes
-        """
-        return asyncio.create_task(self._do_fetch_range(start, end))
 
     async def _do_fetch_range(self, start: int, end: int) -> bytes:
         """
@@ -183,8 +179,9 @@ class _OpenedAsyncHttpFile:
 
     async def close(self) -> None:
         """
-        Close the file and session.
+        Close the file and session, releasing any temporary cache directory.
         """
+        self.cache.close()
         await self.session.close()
 
 
@@ -288,10 +285,14 @@ class AsyncHttpFile:
     def __init__(
         self,
         url: str,
-        minimum_range_request_bytes: int = 8192,
         prefetch_bytes: int = 2**20,
         prefetch_direction: Literal['START', 'END'] = 'END',
         session_kwargs: dict[str, Any] | None = None,
+        cache_dir: str | None = None,
+        block_size: int | None = None,
+        max_bytes: int | None = None,
+        immutable: bool | None = None,
+        minimum_range_request_bytes: int | None = None,
     ) -> None:
         """
         Initialize async HTTP file wrapper.
@@ -300,26 +301,49 @@ class AsyncHttpFile:
             url: HTTP/HTTPS URL for a file
 
         Keyword Args:
-            minimum_range_request_bytes:
-                Least number of bytes to request,
-                except when filling cache gaps
             prefetch_bytes:
                 How many bytes to request when opening the file.
                 Set to 0 or less to disable prefetch. Default 1 MiB.
             prefetch_direction:
                 Whether to prefetch from file start or file end.
                 Possible values `START` or `END`.
+            cache_dir:
+                Directory for the disk-backed block cache. Falls back to
+                ``HCTEF_CACHE_DIR`` then a per-process temporary directory.
+            block_size:
+                Fixed block size in bytes. Falls back to
+                ``HCTEF_CACHE_BLOCK_BYTES`` then 1 MiB.
+            max_bytes:
+                Optional cap on the whole cache dir, enforced by LRU eviction.
+                Falls back to ``HCTEF_CACHE_MAX_BYTES``.
+            immutable:
+                Skip etag/last-modified validation. Falls back to
+                ``HCTEF_CACHE_IMMUTABLE``.
+            minimum_range_request_bytes:
+                Deprecated and ignored; ``block_size`` subsumes request
+                coalescing.
 
         Raises:
             HctefUrlError: If URL is invalid
         """
+        if minimum_range_request_bytes is not None:
+            warnings.warn(
+                'minimum_range_request_bytes is deprecated and ignored; '
+                'use block_size instead',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         _check_url(url)
         self.url = url
         self._prefetch_bytes = prefetch_bytes
         self._prefetch_direction = prefetch_direction
-        self._minimum_range_request_bytes = minimum_range_request_bytes
         self._cursor: AsyncHttpFileCursor | None = None
         self._session_args = session_kwargs if session_kwargs else {}
+        self._cache_dir = cache_dir
+        self._block_size = block_size
+        self._max_bytes = max_bytes
+        self._immutable = immutable
 
     @property
     def cursor(self) -> AsyncHttpFileCursor:
