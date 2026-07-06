@@ -12,6 +12,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from .exceptions import HctefNetworkError
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BLOCK_BYTES = 2**20  # 1 MiB
@@ -183,6 +185,22 @@ class _BlockStore:
     def _missing_blocks(self, indices: range) -> list[int]:
         return [i for i in indices if not self._block_path(i).exists()]
 
+    def _check_fetched(self, start: int, end: int, data: bytes) -> bytes:
+        """
+        Refuse wrong-sized fetch results before they reach the disk cache.
+
+        A wrong-sized body means a bad response -- a server that ignored the
+        Range header and sent the whole file, or a truncated transfer.
+        Guarding here covers every transport (including injected ones) at the
+        single point where bytes are about to be persisted.
+        """
+        if len(data) != end - start:
+            raise HctefNetworkError(
+                f'Fetched {len(data)} bytes for range {start}-{end} of '
+                f'{self.url} (expected {end - start}); refusing to cache',
+            )
+        return data
+
     # -- disk I/O ---------------------------------------------------------
 
     def _atomic_write(self, dest: Path, data: bytes) -> None:
@@ -314,7 +332,11 @@ class BlockCache(_BlockStore):
         for first, last in self._coalesce(self._missing_blocks(indices)):
             fetch_start, fetch_end = self._run_byte_range(first, last)
             protected.update(range(first, last + 1))
-            data = self._fetch(fetch_start, fetch_end)
+            data = self._check_fetched(
+                fetch_start,
+                fetch_end,
+                self._fetch(fetch_start, fetch_end),
+            )
             self._write_run(first, data, protected)
 
         self._touch(indices)

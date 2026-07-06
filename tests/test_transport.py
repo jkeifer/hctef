@@ -5,6 +5,7 @@ import types
 from collections.abc import Callable
 from typing import Any
 
+import aiohttp
 import pytest
 
 from hctef.aio import AsyncHttpFile
@@ -275,6 +276,141 @@ def test_unknown_transport_name() -> None:
         create_transport('carrier-pigeon')  # type: ignore[arg-type]
 
 
+# -- aiohttp transport retry ---------------------------------------------------
+
+
+class _FakeAiohttpResponse:
+    def __init__(
+        self,
+        status: int,
+        body: bytes = b'',
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+
+    async def read(self) -> bytes:
+        return self._body
+
+
+# One scripted outcome per request: an exception raised on __aenter__ (as
+# aiohttp does for connection failures) or a response to hand back.
+Outcome = Exception | _FakeAiohttpResponse
+
+
+class _ScriptedRequestCM:
+    def __init__(self, outcome: Outcome) -> None:
+        self._outcome = outcome
+
+    async def __aenter__(self) -> _FakeAiohttpResponse:
+        if isinstance(self._outcome, Exception):
+            raise self._outcome
+        return self._outcome
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        return None
+
+
+class ScriptedSession:
+    """Stand-in aiohttp session; each get() consumes the next scripted outcome."""
+
+    def __init__(self, *outcomes: Outcome) -> None:
+        self._outcomes = list(outcomes)
+        self.requests: list[dict[str, str]] = []
+
+    def get(self, url: str, headers: dict[str, str]) -> _ScriptedRequestCM:
+        self.requests.append(headers)
+        return _ScriptedRequestCM(self._outcomes.pop(0))
+
+
+async def _scripted_transport(
+    *outcomes: Outcome,
+) -> tuple[AiohttpTransport, ScriptedSession]:
+    transport = AiohttpTransport()
+    await transport.close()  # discard the real session before swapping in the fake
+    session = ScriptedSession(*outcomes)
+    transport._session = session  # type: ignore[assignment]
+    return transport, session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'failure',
+    [
+        pytest.param(aiohttp.ServerDisconnectedError(), id='disconnect'),
+        pytest.param(aiohttp.ClientOSError(), id='conn-reset'),
+        pytest.param(aiohttp.ClientPayloadError(), id='truncated-body'),
+        pytest.param(_FakeAiohttpResponse(503), id='slowdown-503'),
+    ],
+)
+async def test_aiohttp_fetch_range_retries_once(failure: Outcome) -> None:
+    transport, session = await _scripted_transport(
+        failure,
+        _FakeAiohttpResponse(206, DATA),
+    )
+    assert await transport.fetch_range(URL, 10, 20) == DATA
+    assert len(session.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'failure',
+    [
+        pytest.param(aiohttp.ServerDisconnectedError(), id='disconnect'),
+        pytest.param(_FakeAiohttpResponse(503), id='slowdown-503'),
+    ],
+)
+async def test_aiohttp_fetch_range_persistent_failure_fails(
+    failure: Outcome,
+) -> None:
+    transport, session = await _scripted_transport(failure, failure)
+    with pytest.raises(HctefNetworkError, match='Failed to fetch'):
+        await transport.fetch_range(URL, 10, 20)
+    # exactly one retry, no runaway loop
+    assert len(session.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_fetch_range_rejects_non_206() -> None:
+    # A 200 means the server ignored Range; the full body must not be
+    # returned as if it were the slice, and it is not worth a retry.
+    transport, session = await _scripted_transport(_FakeAiohttpResponse(200, DATA))
+    with pytest.raises(HctefNetworkError, match='206'):
+        await transport.fetch_range(URL, 10, 20)
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_probe_success_one_byte_range() -> None:
+    transport, session = await _scripted_transport(
+        _FakeAiohttpResponse(
+            206,
+            b'\x00',
+            {'Content-Range': f'bytes 0-0/{len(DATA)}', 'ETag': '"e"'},
+        ),
+    )
+    info = await transport.probe(URL)
+    assert info.size == len(DATA)
+    assert info.etag == '"e"'
+    # Probe uses a one-byte range so the server doesn't stream the whole body
+    assert session.requests[0]['Range'] == 'bytes=0-0'
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_probe_http_error_names_status() -> None:
+    transport, _ = await _scripted_transport(_FakeAiohttpResponse(404))
+    with pytest.raises(HctefNetworkError, match='404'):
+        await transport.probe(URL)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_probe_no_range_support_message_not_shadowed() -> None:
+    transport, _ = await _scripted_transport(_FakeAiohttpResponse(200, DATA))
+    with pytest.raises(HctefNetworkError, match='does not support range requests'):
+        await transport.probe(URL)
+
+
 # -- pyfetch transport behavior ----------------------------------------------
 
 
@@ -454,6 +590,25 @@ async def test_injected_hctef_free_transport_end_to_end(tmp_path: Any) -> None:
     # ...but is caller-owned: AsyncHttpFile.close() must not close it
     assert not transport.closed
     await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_short_fetch_result_rejected_not_cached(tmp_path: Any) -> None:
+    class ShortTransport(FakeTransport):
+        async def fetch_range(self, url: str, start: int, end: int) -> bytes:
+            return (await super().fetch_range(url, start, end))[:-1]
+
+    async with AsyncHttpFile(
+        URL,
+        transport=ShortTransport(),
+        block_size=64,
+        prefetch_bytes=0,
+        cache_dir=str(tmp_path),
+    ) as hf:
+        with pytest.raises(HctefNetworkError, match='refusing to cache'):
+            await hf.read(10)
+    # the bad bytes must not have been persisted
+    assert not list(tmp_path.rglob('*.blk'))
 
 
 @pytest.mark.asyncio

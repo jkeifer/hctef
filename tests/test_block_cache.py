@@ -42,6 +42,25 @@ def make_cache(
     )
 
 
+def test_wrong_length_fetch_rejected_not_cached(tmp_path: Path) -> None:
+    from hctef.exceptions import HctefNetworkError
+
+    def short_fetch(start: int, end: int) -> bytes:
+        return CONTENT[start : end - 1]  # one byte short
+
+    cache = BlockCache(
+        'https://example.com/file.bin',
+        len(CONTENT),
+        short_fetch,
+        cache_dir=str(tmp_path),
+        block_size=100,
+    )
+    with pytest.raises(HctefNetworkError, match='refusing to cache'):
+        cache.read(0, 50)
+    # the bad bytes must not have been persisted
+    assert not list(tmp_path.rglob('*.blk'))
+
+
 def test_block_math_and_final_short_block(tmp_path: Path) -> None:
     log: FetchLog = []
     cache = make_cache(tmp_path, log)
