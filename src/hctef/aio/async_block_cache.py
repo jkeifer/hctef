@@ -56,7 +56,11 @@ class AsyncBlockCache(_BlockStore):
             fetch_start, fetch_end = self._run_byte_range(first, last)
             # Protect every block currently in flight for this URL from eviction.
             protected = set(self._inflight) | set(range(first, last + 1))
-            data = await self._fetch(fetch_start, fetch_end)
+            data = self._check_fetched(
+                fetch_start,
+                fetch_end,
+                await self._fetch(fetch_start, fetch_end),
+            )
             self._write_run(first, data, protected)
         finally:
             for index in range(first, last + 1):

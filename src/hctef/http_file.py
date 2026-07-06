@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.error
 import urllib.request
 import warnings
 
@@ -7,6 +8,9 @@ from typing import Literal, Self
 
 from .block_cache import BlockCache
 from .exceptions import HctefNetworkError, HctefUrlError
+
+# urllib has no default timeout, so a dead connection would block forever.
+DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 def _check_url(url: str) -> None:
@@ -80,11 +84,16 @@ class _OpenedHttpFile:
             HctefNetworkError: If size cannot be determined
         """
         try:
+            # One-byte range: the Content-Range total is the same, and the
+            # server never starts streaming the whole body just for a probe.
             request = urllib.request.Request(  # noqa: S310
                 self.http_file.url,
-                headers={'Range': 'bytes=0-'},
+                headers={'Range': 'bytes=0-0'},
             )
-            with urllib.request.urlopen(request) as response:  # noqa: S310
+            with urllib.request.urlopen(  # noqa: S310
+                request,
+                timeout=self.http_file._timeout,
+            ) as response:
                 self._etag = response.headers.get('ETag')
                 self._last_modified = response.headers.get('Last-Modified')
                 content_range = response.headers.get('Content-Range')
@@ -95,6 +104,12 @@ class _OpenedHttpFile:
                 raise HctefNetworkError(
                     f'Server does not support range requests for {self.http_file.url}',
                 )
+        except HctefNetworkError:
+            raise
+        except urllib.error.HTTPError as e:
+            raise HctefNetworkError(
+                f'HTTP {e.code} probing {self.http_file.url}',
+            ) from e
         except Exception as e:
             raise HctefNetworkError(
                 f'Cannot determine file size for {self.http_file.url}',
@@ -139,8 +154,22 @@ class _OpenedHttpFile:
                 self.http_file.url,
                 headers={'Range': f'bytes={start}-{end - 1}'},
             )
-            with urllib.request.urlopen(request) as response:  # noqa: S310
+            with urllib.request.urlopen(  # noqa: S310
+                request,
+                timeout=self.http_file._timeout,
+            ) as response:
+                if response.status != 206:
+                    # A 200 here means the server ignored the Range header;
+                    # its full body must never be cached as if it were the
+                    # slice.
+                    raise HctefNetworkError(
+                        f'Expected 206 Partial Content fetching bytes '
+                        f'{start}-{end} from {self.http_file.url}, '
+                        f'got {response.status}',
+                    )
                 return response.read()
+        except HctefNetworkError:
+            raise
         except Exception as e:
             raise HctefNetworkError(
                 f'Failed to fetch bytes {start}-{end} from {self.http_file.url}:',
@@ -182,6 +211,7 @@ class HttpFile:
         block_size: int | None = None,
         max_bytes: int | None = None,
         immutable: bool | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
         minimum_range_request_bytes: int | None = None,
     ) -> None:
         """
@@ -209,6 +239,8 @@ class HttpFile:
             immutable:
                 Skip etag/last-modified validation. Falls back to
                 ``HCTEF_CACHE_IMMUTABLE``.
+            timeout:
+                Socket timeout in seconds for each HTTP request.
             minimum_range_request_bytes:
                 Deprecated and ignored; ``block_size`` subsumes request
                 coalescing.
@@ -234,6 +266,7 @@ class HttpFile:
         self._block_size = block_size
         self._max_bytes = max_bytes
         self._immutable = immutable
+        self._timeout = timeout
         self._opened: _OpenedHttpFile | None = None
 
     @property
