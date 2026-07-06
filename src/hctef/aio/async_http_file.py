@@ -4,16 +4,10 @@ import warnings
 
 from typing import Any, Literal, Self
 
-try:
-    import aiohttp
-except ImportError:
-    raise ImportError(
-        'Must install hctef with `[async]` extra to get necessary dependencies',
-    ) from None
-
-from hctef.exceptions import HctefNetworkError, HctefUrlError
+from hctef.exceptions import HctefUrlError
 
 from .async_block_cache import AsyncBlockCache
+from .transport import AsyncTransport, TransportName, create_transport
 
 
 def _check_url(url: str) -> None:
@@ -38,23 +32,29 @@ class _OpenedAsyncHttpFile:
     def __init__(
         self,
         http_file: AsyncHttpFile,
-        session: aiohttp.ClientSession,
+        transport: AsyncTransport,
         size: int,
         etag: str | None = None,
         last_modified: str | None = None,
+        owns_transport: bool = True,
     ) -> None:
         """
         Initialize opened HTTP file with pre-fetched async values.
 
         Args:
             http_file: The parent AsyncHttpFile instance
-            session: Pre-created aiohttp session
+            transport: Pre-created async transport
             size: File size obtained via async HTTP request
             etag: ETag response header, if any
             last_modified: Last-Modified response header, if any
+            owns_transport:
+                Whether this file owns the transport's lifecycle. Owned
+                transports (created internally from a transport name) are
+                closed on close(); injected instances are not.
         """
         self.http_file = http_file
-        self.session = session
+        self.transport = transport
+        self.owns_transport = owns_transport
         self.size = size
         self.cache = AsyncBlockCache(
             http_file.url,
@@ -73,51 +73,51 @@ class _OpenedAsyncHttpFile:
         """
         Async factory method to create _OpenedAsyncHttpFile.
 
+        Transports created here from a transport name are owned by the
+        opened file (closed on close() and on probe failure). Injected
+        transport instances are caller-owned and never closed.
+
         Args:
             http_file: The parent AsyncHttpFile instance
 
         Returns:
             Fully initialized _OpenedAsyncHttpFile instance
-        """
-        session = aiohttp.ClientSession(**http_file._session_args)
-        size, etag, last_modified = await cls._get_file_size(session, http_file.url)
-        return cls(http_file, session, size, etag, last_modified)
-
-    @staticmethod
-    async def _get_file_size(
-        session: aiohttp.ClientSession,
-        url: str,
-    ) -> tuple[int, str | None, str | None]:
-        """
-        Get total file size and validators using an async HTTP range request.
-
-        Args:
-            session: aiohttp session to use for request
-            url: URL to fetch size for
-
-        Returns:
-            Tuple of (file size in bytes, ETag, Last-Modified)
 
         Raises:
-            HctefNetworkError: If size cannot be determined
+            ValueError: If session_kwargs is combined with an injected
+                transport instance
         """
-        try:
-            headers = {'Range': 'bytes=0-'}
-            async with session.get(url, headers=headers) as response:
-                etag = response.headers.get('ETag')
-                last_modified = response.headers.get('Last-Modified')
-                content_range = response.headers.get('Content-Range')
-                if content_range:
-                    return int(content_range.split('/')[-1]), etag, last_modified
-
-                # If no Content-Range header, server doesn't support ranges
-                raise HctefNetworkError(
-                    f'Server does not support range requests for {url}',
+        requested = http_file._transport
+        if requested is None or isinstance(requested, str):
+            transport: AsyncTransport = create_transport(
+                requested,
+                http_file._session_args,
+            )
+            owns_transport = True
+        else:
+            if http_file._session_args:
+                raise ValueError(
+                    'session_kwargs only configures the built-in aiohttp '
+                    'transport and is not supported with an injected '
+                    'transport instance',
                 )
-        except Exception as e:
-            raise HctefNetworkError(
-                f'Cannot determine file size for {url}',
-            ) from e
+            transport = requested
+            owns_transport = False
+
+        try:
+            info = await transport.probe(http_file.url)
+        except Exception:
+            if owns_transport:
+                await transport.close()
+            raise
+        return cls(
+            http_file,
+            transport,
+            info.size,
+            info.etag,
+            info.last_modified,
+            owns_transport=owns_transport,
+        )
 
     async def _do_fetch_range(self, start: int, end: int) -> bytes:
         """
@@ -138,19 +138,7 @@ class _OpenedAsyncHttpFile:
                 f'Invalid byte range: {start}-{end} (file size: {self.size})',
             )
 
-        try:
-            headers = {'Range': f'bytes={start}-{end - 1}'}
-            async with self.session.get(
-                self.http_file.url,
-                headers=headers,
-            ) as response:
-                return await response.read()
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise HctefNetworkError(
-                f'Failed to fetch bytes {start}-{end} from {self.http_file.url}',
-            ) from e
+        return await self.transport.fetch_range(self.http_file.url, start, end)
 
     async def read(self, position: int, size: int | None = None, /) -> bytes:
         """
@@ -179,10 +167,15 @@ class _OpenedAsyncHttpFile:
 
     async def close(self) -> None:
         """
-        Close the file and session, releasing any temporary cache directory.
+        Close the file, releasing any temporary cache directory.
+
+        The transport is closed only if it is owned by this file (i.e. it
+        was created internally from a transport name). Injected transport
+        instances are left open for their caller to manage.
         """
         self.cache.close()
-        await self.session.close()
+        if self.owns_transport:
+            await self.transport.close()
 
 
 class AsyncHttpFileCursor:
@@ -280,6 +273,13 @@ class AsyncHttpFileCursor:
 class AsyncHttpFile:
     """
     Async file-like wrapper for HTTP URLs with concurrent read support.
+
+    Requests are made through a pluggable transport: 'aiohttp' (the default
+    on CPython; requires the `[async]` extra) or 'pyfetch' (the default
+    under Pyodide/emscripten; uses the browser fetch API via
+    ``pyodide.http.pyfetch``). Alternatively, any object conforming to the
+    ``AsyncTransport`` protocol can be injected directly; injected instances
+    are caller-owned and never closed by this class.
     """
 
     def __init__(
@@ -288,6 +288,7 @@ class AsyncHttpFile:
         prefetch_bytes: int = 2**20,
         prefetch_direction: Literal['START', 'END'] = 'END',
         session_kwargs: dict[str, Any] | None = None,
+        transport: TransportName | AsyncTransport | None = None,
         cache_dir: str | None = None,
         block_size: int | None = None,
         max_bytes: int | None = None,
@@ -307,6 +308,21 @@ class AsyncHttpFile:
             prefetch_direction:
                 Whether to prefetch from file start or file end.
                 Possible values `START` or `END`.
+            session_kwargs:
+                Keyword arguments passed to ``aiohttp.ClientSession``.
+                Specific to the built-in 'aiohttp' transport; passing it
+                with the 'pyfetch' transport or an injected transport
+                instance raises ValueError at open time.
+            transport:
+                Which HTTP transport to use. A string selects a built-in
+                backend: 'aiohttp' or 'pyfetch'. Defaults to 'pyfetch' when
+                running under Pyodide/emscripten (where aiohttp cannot work)
+                and 'aiohttp' everywhere else. Transports created here from
+                a name are owned by this file and closed on close().
+                Alternatively, pass any ``AsyncTransport`` instance to use
+                it as-is; injected instances are NOT owned by this file --
+                close() never closes them and the caller manages their
+                lifecycle (including on open()/probe failure).
             cache_dir:
                 Directory for the disk-backed block cache. Falls back to
                 ``HCTEF_CACHE_DIR`` then a per-process temporary directory.
@@ -340,6 +356,7 @@ class AsyncHttpFile:
         self._prefetch_direction = prefetch_direction
         self._cursor: AsyncHttpFileCursor | None = None
         self._session_args = session_kwargs if session_kwargs else {}
+        self._transport = transport
         self._cache_dir = cache_dir
         self._block_size = block_size
         self._max_bytes = max_bytes

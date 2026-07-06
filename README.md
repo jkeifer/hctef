@@ -39,6 +39,13 @@ To include async support:
 pip install hctef[async]
 ```
 
+The `[async]` extra pulls in `aiohttp`, the default async transport on regular
+(CPython) runtimes. When running under [Pyodide](https://pyodide.org)
+(Python-in-the-browser via WebAssembly), no extra is needed: `AsyncHttpFile`
+automatically uses `pyodide.http.pyfetch` (a thin wrapper over the browser's
+`fetch` API that ships with the Pyodide runtime) instead, since socket-based
+clients like aiohttp cannot work in the browser.
+
 ## Quick Start
 
 ### Synchronous Usage
@@ -126,6 +133,65 @@ Cursors are lightweight and share:
 - Byte range cache (deduplication of overlapping requests)
 - File metadata
 
+#### Async Transports
+
+`AsyncHttpFile` supports two HTTP transports, selected via the `transport`
+parameter:
+
+- **`'aiohttp'`** (default on CPython): uses an `aiohttp.ClientSession`.
+  Requires the `[async]` extra. The `session_kwargs` parameter is passed
+  through to `aiohttp.ClientSession` and is specific to this transport.
+- **`'pyfetch'`** (default under Pyodide/emscripten): uses
+  `pyodide.http.pyfetch`, i.e. the browser's `fetch` API. Requires no extra
+  dependencies but only works inside a Pyodide runtime.
+
+When `transport` is not given, the transport is chosen automatically based on
+the runtime (`sys.platform == 'emscripten'` selects `'pyfetch'`):
+
+```python
+# Force a specific transport
+f = AsyncHttpFile(url, transport='pyfetch')
+```
+
+##### Custom transports
+
+`transport` also accepts a transport *instance*, used as-is. `AsyncTransport`
+is a structural protocol (`typing.Protocol`), so any class with the three
+methods works — no hctef imports or subclassing required:
+
+```python
+class MyTransport:
+    async def probe(self, url: str) -> RemoteFileInfo:
+        """Return an object with .size, .etag, and .last_modified."""
+
+    async def fetch_range(self, url: str, start: int, end: int) -> bytes:
+        """Return the byte range [start, end) — end-exclusive."""
+
+    async def close(self) -> None:
+        """Release any resources held by the transport."""
+
+
+transport = MyTransport()
+async with AsyncHttpFile(url, transport=transport) as f:
+    data = await f.read(1024)
+await transport.close()  # you own it; hctef won't close it for you
+```
+
+**Ownership rule:** transports created *by* `AsyncHttpFile` from a name
+(`'aiohttp'`/`'pyfetch'`/auto-selected) are owned by it and closed on
+`close()` (and on open failure). An *injected* instance is never closed by
+`AsyncHttpFile` — the caller manages its lifecycle, which also makes it safe
+to share one transport across several files. `session_kwargs` only configures
+the built-in `'aiohttp'` backend; combining it with an injected instance (or
+`'pyfetch'`) raises `ValueError`.
+
+> **CORS note for the browser:** with the `'pyfetch'` transport, response
+> headers on cross-origin requests are only visible when the server exposes
+> them. If opening a file fails with a "cannot determine file size" error,
+> the server likely needs to send
+> `Access-Control-Expose-Headers: Content-Range` in addition to allowing the
+> origin.
+
 ## Configuration Options
 
 Both `HttpFile` and `AsyncHttpFile` accept the following parameters:
@@ -155,6 +221,17 @@ HttpFile(
 - **`immutable`**: Trust an existing cache without revalidating `ETag` /
   `Last-Modified` against the live response
 
+`AsyncHttpFile` additionally accepts:
+
+- **`transport`**: Which async HTTP transport to use, `'aiohttp'` or
+  `'pyfetch'` (see [Async Transports](#async-transports)). Defaults to
+  `'pyfetch'` under Pyodide/emscripten and `'aiohttp'` everywhere else.
+  May also be an `AsyncTransport` instance, which is used as-is and never
+  closed by `AsyncHttpFile` — the caller owns its lifecycle
+- **`session_kwargs`**: Keyword arguments for `aiohttp.ClientSession`;
+  specific to the built-in `'aiohttp'` transport (raises `ValueError` when
+  combined with `'pyfetch'` or an injected transport instance)
+
 > **Note:** `minimum_range_request_bytes` is deprecated and ignored (it emits a
 > `DeprecationWarning`); `block_size` replaces it.
 
@@ -182,7 +259,9 @@ the built-in default.
 
 - Python 3.12 or higher
 - HTTP server must support Range requests
-- For async: `aiohttp>=3.13.0`
+- For async on CPython: `aiohttp>=3.13.0` (the `[async]` extra)
+- For async in the browser: the Pyodide runtime (provides
+  `pyodide.http.pyfetch`; no extra packages needed)
 
 ## How It Works
 
