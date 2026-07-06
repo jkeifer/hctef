@@ -385,7 +385,7 @@ class AsyncHttpFile:
         if prefetch_bytes > 0 and self._prefetch_direction == 'START':
             await self.read(prefetch_bytes)
         elif prefetch_bytes > 0 and self._prefetch_direction == 'END':
-            self.cursor.seek(prefetch_bytes, 2)
+            self.cursor.seek(-prefetch_bytes, 2)
             await self.read(prefetch_bytes)
 
         self.cursor.seek(0)
