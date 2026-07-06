@@ -315,14 +315,14 @@ cd hctef
 # Install dependencies
 uv sync --all-extras --dev
 
-# Setup pre-commit
-pre-commit install
+# Setup git hooks (prek, a fast pre-commit reimplementation)
+uv run prek install
 
 # Run tests
-pytest
+uv run pytest
 
-# Run all checks with pre-commit
-pre-commit run --all-files
+# Run all checks with prek
+uv run prek run --all-files
 ```
 
 ## Future Ideas

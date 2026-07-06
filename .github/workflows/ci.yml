@@ -31,8 +31,8 @@ jobs:
             --locked \
             --all-extras \
             --no-editable
-      - name: Pre-Commit Hooks
-        run: uv run pre-commit run --all-files
+      - name: Prek
+        run: uv run prek run --all-files
       - name: Test
         run: uv run pytest
       - name: "Upload coverage to Codecov"
