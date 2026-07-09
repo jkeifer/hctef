@@ -93,6 +93,20 @@ async with AsyncHttpFile(url) as f:
     more_data = await f.read(50)
 ```
 
+#### Warming the cache with `prefetch`
+
+Batch-fetch known byte ranges (e.g. every bloom-filter or page-index range
+from a Parquet footer) ahead of time; adjacent and overlapping ranges are
+coalesced into as few requests as possible:
+
+```python
+fetched = await f.prefetch([(offset, length) for offset, length in ranges])
+```
+
+Returns the number of bytes newly requested (0 if already cached). Later
+reads of the warmed ranges are served from cache. The synchronous
+`HttpFile` has the same method (ranges are fetched sequentially there).
+
 #### Parallel Reads with Multiple Cursors
 
 Create independent cursors to read from different positions concurrently:
@@ -231,6 +245,10 @@ HttpFile(
 - **`session_kwargs`**: Keyword arguments for `aiohttp.ClientSession`;
   specific to the built-in `'aiohttp'` transport (raises `ValueError` when
   combined with `'pyfetch'` or an injected transport instance)
+- **`max_concurrency`** (default `8`): maximum number of range requests in
+  flight at once for this file. Browsers put every request to an origin on
+  a single connection, and real servers start failing range GETs past
+  ~12-16 concurrent requests
 
 > **Note:** `minimum_range_request_bytes` is deprecated and ignored (it emits a
 > `DeprecationWarning`); `block_size` replaces it.
@@ -281,14 +299,42 @@ Because blocks live on disk and are read back through the OS page cache, hot
 data stays fast without being pinned in Python memory, and the cache is reused
 by later opens and other processes sharing the same directory.
 
+## Stability Guarantees
+
+Downstream consumers may rely on the following; changing any of them is a
+breaking change:
+
+- **Exception class names are API.** `HctefError`, `HctefNetworkError`,
+  `RangeRequestsUnsupportedError`, and `HctefUrlError` are stable, greppable
+  names (consumers on the far side of a traceback, e.g. pyodide -> JS, can
+  only match on them). Message wording is NOT stable; match on class names,
+  never message text.
+- **Transport auto-selection.** `AsyncHttpFile` defaults to the `pyfetch`
+  transport under Pyodide/emscripten and `aiohttp` everywhere else.
+- **Block-cache read-through.** Every read (and `prefetch`) goes through the
+  block cache; a range fetched once is served from cache for the reader's
+  lifetime and never re-fetched.
+- **Reader lifecycle.** `await AsyncHttpFile(url).open()` without a context
+  manager is supported; `close()` is async and idempotent.
+
 ## Error Handling
 
 `hctef` defines custom exceptions:
 
-- `HctefError`: Base exception class
-- `HctefNetworkError`: Raised for network-related errors (inherits from
-  `IOError`)
-- `HctefUrlError`: Raised for invalid URLs (inherits from `ValueError`)
+- `HctefError`: base class for all hctef errors
+- `HctefNetworkError`: transport failure (DNS, timeout, exhausted retries on
+  5xx/429) — transient; retrying the operation may succeed
+- `RangeRequestsUnsupportedError` (subclass of `HctefNetworkError`): this
+  server cannot serve usable range requests — permanent for the URL; fall
+  back to downloading the whole file. Its `reason` attribute is
+  `'no-range-support'` (server answered 200 to a bounded Range request) or
+  `'content-range-hidden'` (the Content-Range header was not visible,
+  typically a missing `Access-Control-Expose-Headers` on CORS requests)
+- `HctefUrlError`: invalid URL (inherits from `ValueError`)
+
+Transient 5xx/429 responses on range requests are retried a bounded number of
+times with exponential backoff, honoring `Retry-After` (seconds form) when
+present.
 
 ```python
 from hctef import HttpFile

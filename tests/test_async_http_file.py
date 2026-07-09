@@ -1,9 +1,13 @@
 import asyncio
 import os
 
+from typing import Any
+
 import pytest
 
 from hctef.aio import AsyncHttpFile
+
+from .test_transport import DATA, URL, FakeTransport
 
 
 @pytest.mark.asyncio
@@ -222,3 +226,22 @@ async def test_clone_user_after_close(parquet_url: str) -> None:
         cursor = hf.clone()
     with pytest.raises(RuntimeError, match='Session is closed'):
         await cursor.read(100)
+
+
+@pytest.mark.asyncio
+async def test_open_close_without_context_manager(tmp_path: Any) -> None:
+    # The ver-por-que worker opens without a context manager (the reader
+    # outlives the parse) and closes explicitly later; close() is async
+    # and idempotent.
+    transport = FakeTransport()
+    hf = await AsyncHttpFile(
+        URL,
+        transport=transport,
+        prefetch_bytes=0,
+        cache_dir=str(tmp_path),
+    ).open()
+    assert await hf.read(10) == DATA[:10]
+    await hf.close()
+    await hf.close()  # second close is a no-op
+    with pytest.raises(ValueError, match='closed file'):
+        await hf.read(1)
