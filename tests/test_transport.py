@@ -511,6 +511,22 @@ async def test_pyfetch_probe_no_range_support_typed(
 
 
 @pytest.mark.asyncio
+async def test_pyfetch_probe_http_error_not_typed_as_range_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 5xx (or 429) with no visible Content-Range is a plain HTTP
+    # failure and must never be classified as "range requests unsupported"
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(500, {})
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    with pytest.raises(HctefNetworkError, match='500') as excinfo:
+        await transport.probe(URL)
+    assert not isinstance(excinfo.value, RangeRequestsUnsupportedError)
+
+
+@pytest.mark.asyncio
 async def test_pyfetch_probe_network_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

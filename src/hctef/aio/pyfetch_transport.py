@@ -67,6 +67,12 @@ class PyfetchTransport:
         self._check_open()
         try:
             response = await self._pyfetch(url, headers={'Range': 'bytes=0-0'})
+            if response.status >= 400:
+                # A 4xx/5xx (e.g. 429/500) is a plain HTTP failure and must
+                # never be classified as "range requests unsupported"
+                raise HctefNetworkError(
+                    f'HTTP {response.status} probing {url}',
+                )
             headers = {k.lower(): v for k, v in response.headers.items()}
             etag = headers.get('etag')
             last_modified = headers.get('last-modified')
