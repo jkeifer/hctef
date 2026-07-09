@@ -7,7 +7,11 @@ import warnings
 from typing import Literal, Self
 
 from .block_cache import BlockCache
-from .exceptions import HctefNetworkError, HctefUrlError
+from .exceptions import (
+    HctefNetworkError,
+    HctefUrlError,
+    RangeRequestsUnsupportedError,
+)
 
 # urllib has no default timeout, so a dead connection would block forever.
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -101,8 +105,9 @@ class _OpenedHttpFile:
                     return int(content_range.split('/')[-1])
 
                 # If no Content-Range header, server doesn't support ranges
-                raise HctefNetworkError(
+                raise RangeRequestsUnsupportedError(
                     f'Server does not support range requests for {self.http_file.url}',
+                    reason='no-range-support',
                 )
         except HctefNetworkError:
             raise
@@ -158,10 +163,15 @@ class _OpenedHttpFile:
                 request,
                 timeout=self.http_file._timeout,
             ) as response:
+                if response.status == 200:
+                    # The server ignored the Range header; its full body
+                    # must never be cached as if it were the slice.
+                    raise RangeRequestsUnsupportedError(
+                        f'Server ignored the Range header fetching bytes '
+                        f'{start}-{end} from {self.http_file.url} (got 200)',
+                        reason='no-range-support',
+                    )
                 if response.status != 206:
-                    # A 200 here means the server ignored the Range header;
-                    # its full body must never be cached as if it were the
-                    # slice.
                     raise HctefNetworkError(
                         f'Expected 206 Partial Content fetching bytes '
                         f'{start}-{end} from {self.http_file.url}, '

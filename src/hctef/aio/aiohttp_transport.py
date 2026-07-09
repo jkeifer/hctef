@@ -9,7 +9,7 @@ except ImportError:
         'Must install hctef with `[async]` extra to get necessary dependencies',
     ) from None
 
-from hctef.exceptions import HctefNetworkError
+from hctef.exceptions import HctefNetworkError, RangeRequestsUnsupportedError
 
 from .transport import RemoteFileInfo
 
@@ -84,8 +84,9 @@ class AiohttpTransport:
                     )
 
                 # If no Content-Range header, server doesn't support ranges
-                raise HctefNetworkError(
+                raise RangeRequestsUnsupportedError(
                     f'Server does not support range requests for {url}',
+                    reason='no-range-support',
                 )
         except (RuntimeError, HctefNetworkError):
             raise
@@ -133,9 +134,15 @@ class AiohttpTransport:
         async with self._session.get(url, headers=headers) as response:
             if response.status in _RETRYABLE_STATUSES:
                 raise _RetryableStatusError(f'HTTP {response.status}')
+            if response.status == 200:
+                # The server ignored the Range header; its full body must
+                # never be cached as if it were the slice.
+                raise RangeRequestsUnsupportedError(
+                    f'Server ignored the Range header fetching bytes '
+                    f'{start}-{end} from {url} (got 200)',
+                    reason='no-range-support',
+                )
             if response.status != 206:
-                # A 200 here means the server ignored the Range header; its
-                # full body must never be cached as if it were the slice.
                 raise HctefNetworkError(
                     f'Expected 206 Partial Content fetching bytes '
                     f'{start}-{end} from {url}, got {response.status}',

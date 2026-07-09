@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from hctef.exceptions import HctefNetworkError
+from hctef.exceptions import HctefNetworkError, RangeRequestsUnsupportedError
 
 from .transport import RemoteFileInfo
 
@@ -80,9 +80,16 @@ class PyfetchTransport:
 
             # No Content-Range header: either the server doesn't support
             # range requests, or CORS is hiding the header from us
-            raise HctefNetworkError(
+            if response.status == 206:
+                # Server honored the Range request but CORS hid the header
+                raise RangeRequestsUnsupportedError(
+                    f'Content-Range header is not visible for {url}; {_CORS_HINT}',
+                    reason='content-range-hidden',
+                )
+            raise RangeRequestsUnsupportedError(
                 f'Server does not support range requests for {url}, '
                 f'or the Content-Range header is not visible; {_CORS_HINT}',
+                reason='no-range-support',
             )
         except (RuntimeError, HctefNetworkError):
             raise
@@ -113,6 +120,12 @@ class PyfetchTransport:
                 url,
                 headers={'Range': f'bytes={start}-{end - 1}'},
             )
+            if response.status == 200:
+                raise RangeRequestsUnsupportedError(
+                    f'Server ignored the Range header fetching bytes '
+                    f'{start}-{end} from {url} (got 200)',
+                    reason='no-range-support',
+                )
             if response.status != 206:
                 raise HctefNetworkError(
                     f'Expected 206 Partial Content fetching bytes '

@@ -17,7 +17,7 @@ from hctef.aio.transport import (
     create_transport,
     default_transport_name,
 )
-from hctef.exceptions import HctefNetworkError
+from hctef.exceptions import HctefNetworkError, RangeRequestsUnsupportedError
 
 URL = 'http://example.com/file.bin'
 DATA = bytes(range(256)) * 4  # 1 KiB of predictable data
@@ -376,8 +376,9 @@ async def test_aiohttp_fetch_range_rejects_non_206() -> None:
     # A 200 means the server ignored Range; the full body must not be
     # returned as if it were the slice, and it is not worth a retry.
     transport, session = await _scripted_transport(_FakeAiohttpResponse(200, DATA))
-    with pytest.raises(HctefNetworkError, match='206'):
+    with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
         await transport.fetch_range(URL, 10, 20)
+    assert excinfo.value.reason == 'no-range-support'
     assert len(session.requests) == 1
 
 
@@ -409,6 +410,14 @@ async def test_aiohttp_probe_no_range_support_message_not_shadowed() -> None:
     transport, _ = await _scripted_transport(_FakeAiohttpResponse(200, DATA))
     with pytest.raises(HctefNetworkError, match='does not support range requests'):
         await transport.probe(URL)
+
+
+@pytest.mark.asyncio
+async def test_aiohttp_probe_no_range_support_typed() -> None:
+    transport, _ = await _scripted_transport(_FakeAiohttpResponse(200, DATA))
+    with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
+        await transport.probe(URL)
+    assert excinfo.value.reason == 'no-range-support'
 
 
 # -- pyfetch transport behavior ----------------------------------------------
@@ -447,8 +456,9 @@ async def test_pyfetch_fetch_range_non_206(
 
     _install_fake_pyodide(monkeypatch, pyfetch)
     transport = create_transport('pyfetch')
-    with pytest.raises(HctefNetworkError, match='206'):
+    with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
         await transport.fetch_range(URL, 0, 10)
+    assert excinfo.value.reason == 'no-range-support'
 
 
 @pytest.mark.asyncio
@@ -467,6 +477,37 @@ async def test_pyfetch_probe_cors_hidden_headers(
         match='Access-Control-Expose-Headers',
     ):
         await transport.probe(URL)
+
+
+@pytest.mark.asyncio
+async def test_pyfetch_probe_hidden_content_range_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 206 without Content-Range: the server honored the Range request but
+    # CORS hid the header (missing Access-Control-Expose-Headers)
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(206, {'content-type': 'application/octet-stream'})
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
+        await transport.probe(URL)
+    assert excinfo.value.reason == 'content-range-hidden'
+
+
+@pytest.mark.asyncio
+async def test_pyfetch_probe_no_range_support_typed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 200 without Content-Range: the server ignored the Range header
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        return FakeResponse(200, {}, DATA)
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
+        await transport.probe(URL)
+    assert excinfo.value.reason == 'no-range-support'
 
 
 @pytest.mark.asyncio
