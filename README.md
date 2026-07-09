@@ -100,7 +100,7 @@ from a Parquet footer) ahead of time; adjacent and overlapping ranges are
 coalesced into as few requests as possible:
 
 ```python
-fetched = await f.prefetch([(offset, length) for offset, length in ranges])
+fetched = await f.prefetch([(1024, 4096), (65536, 4096)])
 ```
 
 Returns the number of bytes newly requested (0 if already cached). Later

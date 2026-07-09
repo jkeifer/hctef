@@ -74,8 +74,8 @@ class AsyncBlockCache(_BlockStore):
                 self._inflight[index] = task
 
         pending = {self._inflight[i] for i in indices if i in self._inflight}
-        for task in pending:
-            await task
+        if pending:
+            await asyncio.gather(*pending)
         return requested
 
     async def _fetch_run(self, first: int, last: int) -> None:

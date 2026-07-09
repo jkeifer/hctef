@@ -7,11 +7,15 @@ populated the cache. These tests assert the fake transport actually saw
 range requests covering the file tail during open().
 """
 
+import asyncio
+import gc
+
 from typing import Any
 
 import pytest
 
 from hctef.aio import AsyncHttpFile
+from hctef.exceptions import HctefNetworkError
 
 from .test_transport import (  # noqa: F401
     DATA,
@@ -150,3 +154,43 @@ async def test_prefetch_clamps_to_file_size(tmp_path: Any) -> None:
         hf.seek(-10, 2)
         assert await hf.read() == DATA[-10:]
         assert transport.fetches == [(size - 64, size)]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_multi_run_failure_propagates_cleanly(
+    tmp_path: Any,
+) -> None:
+    # Multiple disjoint failing runs: the error must propagate, and every
+    # fan-out task's exception must be retrieved (no dangling-task noise).
+    class FailingTransport(FakeTransport):
+        async def fetch_range(self, url: str, start: int, end: int) -> bytes:
+            await super().fetch_range(url, start, end)
+            raise HctefNetworkError(f'boom {start}')
+
+    unretrieved: list[str] = []
+
+    def handler(loop: Any, context: dict[str, Any]) -> None:
+        unretrieved.append(context.get('message', ''))
+
+    transport = FailingTransport()
+    async with AsyncHttpFile(
+        URL,
+        transport=transport,
+        block_size=64,
+        prefetch_bytes=0,
+        cache_dir=str(tmp_path),
+    ) as hf:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(handler)
+        try:
+            with pytest.raises(HctefNetworkError):
+                # Three disjoint runs -> three fan-out tasks, all failing
+                await hf.prefetch([(0, 10), (256, 10), (512, 10)])
+            # All three runs were attempted (results retrieved via gather)
+            assert len(transport.fetches) == 3
+            await asyncio.sleep(0)
+            gc.collect()
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(None)
+    assert unretrieved == []
