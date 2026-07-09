@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import warnings
 
 from typing import Any, Literal, Self
@@ -56,6 +57,7 @@ class _OpenedAsyncHttpFile:
         self.transport = transport
         self.owns_transport = owns_transport
         self.size = size
+        self._fetch_semaphore = asyncio.Semaphore(http_file._max_concurrency)
         self.cache = AsyncBlockCache(
             http_file.url,
             self.size,
@@ -138,7 +140,10 @@ class _OpenedAsyncHttpFile:
                 f'Invalid byte range: {start}-{end} (file size: {self.size})',
             )
 
-        return await self.transport.fetch_range(self.http_file.url, start, end)
+        # The cap deliberately covers retries/backoff too: a struggling
+        # server shouldn't see extra pressure while we're backing off.
+        async with self._fetch_semaphore:
+            return await self.transport.fetch_range(self.http_file.url, start, end)
 
     async def read(self, position: int, size: int | None = None, /) -> bytes:
         """
@@ -293,6 +298,7 @@ class AsyncHttpFile:
         block_size: int | None = None,
         max_bytes: int | None = None,
         immutable: bool | None = None,
+        max_concurrency: int = 8,
         minimum_range_request_bytes: int | None = None,
     ) -> None:
         """
@@ -335,6 +341,12 @@ class AsyncHttpFile:
             immutable:
                 Skip etag/last-modified validation. Falls back to
                 ``HCTEF_CACHE_IMMUTABLE``.
+            max_concurrency:
+                Maximum number of range requests in flight at once for
+                this file. Browsers put every request to an origin on one
+                connection, and real servers start failing range GETs
+                past ~12-16 concurrent requests; the default of 8 stays
+                comfortably under that while keeping the pipe full.
             minimum_range_request_bytes:
                 Deprecated and ignored; ``block_size`` subsumes request
                 coalescing.
@@ -351,6 +363,8 @@ class AsyncHttpFile:
             )
 
         _check_url(url)
+        if max_concurrency < 1:
+            raise ValueError('max_concurrency must be >= 1')
         self.url = url
         self._prefetch_bytes = prefetch_bytes
         self._prefetch_direction = prefetch_direction
@@ -361,6 +375,7 @@ class AsyncHttpFile:
         self._block_size = block_size
         self._max_bytes = max_bytes
         self._immutable = immutable
+        self._max_concurrency = max_concurrency
 
     @property
     def cursor(self) -> AsyncHttpFileCursor:
