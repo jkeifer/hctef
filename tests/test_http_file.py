@@ -156,3 +156,36 @@ def test_http_file(parquet_url: str) -> None:
         # Test seeking before the beginning of the file
         hf.seek(-file_size - 100, os.SEEK_END)
         assert hf.tell() == 0  # Position should be clamped
+
+
+def test_prefetch_passthrough(
+    scripted_urlopen: tuple[list[UrlopenOutcome], list[UrlopenCall]],
+    tmp_path: Path,
+) -> None:
+    script, calls = scripted_urlopen
+    body = bytes(i % 256 for i in range(1050))
+    script.append(_probe_ok())
+    script.append(
+        FakeUrlopenResponse(
+            206,
+            {'Content-Range': 'bytes 0-199/1050'},
+            body[:200],
+        ),
+    )
+    with HttpFile(
+        URL,
+        prefetch_bytes=0,
+        cache_dir=str(tmp_path),
+        block_size=100,
+    ) as hf:
+        assert hf.prefetch([(0, 100), (100, 100)]) == 200
+        # Warmed reads are served from cache: no further urlopen calls
+        n_calls = len(calls)
+        assert hf.read(200) == body[:200]
+        assert len(calls) == n_calls
+
+
+def test_prefetch_on_closed_file_raises() -> None:
+    hf = HttpFile(URL)
+    with pytest.raises(ValueError, match='closed file'):
+        hf.prefetch([(0, 10)])

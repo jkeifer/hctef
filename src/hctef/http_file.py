@@ -4,6 +4,7 @@ import urllib.error
 import urllib.request
 import warnings
 
+from collections.abc import Iterable
 from typing import Literal, Self
 
 from .block_cache import BlockCache
@@ -322,6 +323,25 @@ class HttpFile:
             Bytes read from the file
         """
         return self._ohf.read(size)
+
+    def prefetch(self, ranges: Iterable[tuple[int, int]]) -> int:
+        """
+        Warm the block cache for the given (offset, length) byte ranges.
+
+        Adjacent and overlapping ranges are coalesced into as few range
+        requests as possible and clamped to the file size. Later reads of
+        warmed ranges are served from cache without touching the network.
+
+        Args:
+            ranges: Iterable of (offset, length) tuples to warm
+
+        Returns:
+            Number of bytes newly requested (0 if everything was cached)
+
+        Raises:
+            ValueError: If file is not opened
+        """
+        return self._ohf._cache.prefetch(ranges)
 
     def seek(self, offset: int, whence: int = 0, /) -> int:
         """

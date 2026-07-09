@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 from hctef.block_cache import _BlockStore
 
@@ -35,21 +35,48 @@ class AsyncBlockCache(_BlockStore):
             return b''
 
         indices = self._block_indices(start, end)
+        await self._ensure_blocks(indices)
+        self._touch(indices)
+        return self._assemble(start, end)
 
+    async def prefetch(self, ranges: Iterable[tuple[int, int]]) -> int:
+        """
+        Warm the cache for every (offset, length) range given.
+
+        Block indices across all ranges are deduplicated and coalesced, so
+        adjacent and overlapping ranges collapse into as few requests as
+        possible. Ranges are clamped to the file size.
+
+        Returns:
+            Number of bytes newly requested from the transport (0 when
+            everything was already cached or in flight)
+        """
+        indices: set[int] = set()
+        for offset, length in ranges:
+            start = max(offset, 0)
+            end = min(offset + length, self.file_size)
+            indices.update(self._block_indices(start, end))
+        return await self._ensure_blocks(sorted(indices))
+
+    async def _ensure_blocks(self, indices: Sequence[int]) -> int:
+        """
+        Fetch missing blocks and await every in-flight fetch covering
+        `indices` (ours and peers'). Returns bytes newly requested.
+        """
         # Coalesce blocks that are neither on disk nor already being fetched.
         needed = [i for i in self._missing_blocks(indices) if i not in self._inflight]
+        requested = 0
         for first, last in self._coalesce(needed):
+            fetch_start, fetch_end = self._run_byte_range(first, last)
+            requested += fetch_end - fetch_start
             task = asyncio.ensure_future(self._fetch_run(first, last))
             for index in range(first, last + 1):
                 self._inflight[index] = task
 
-        # Await every in-flight task covering any of our blocks (ours + peers').
         pending = {self._inflight[i] for i in indices if i in self._inflight}
         for task in pending:
             await task
-
-        self._touch(indices)
-        return self._assemble(start, end)
+        return requested
 
     async def _fetch_run(self, first: int, last: int) -> None:
         try:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 
+from collections.abc import Iterable
 from typing import Any, Literal, Self
 
 from hctef.exceptions import HctefUrlError
@@ -418,6 +419,26 @@ class AsyncHttpFile:
             ValueError: If file is not opened
         """
         return self.cursor.clone()
+
+    async def prefetch(self, ranges: Iterable[tuple[int, int]]) -> int:
+        """
+        Warm the block cache for the given (offset, length) byte ranges.
+
+        Adjacent and overlapping ranges are coalesced into as few range
+        requests as possible, subject to max_concurrency, and clamped to
+        the file size. Later reads of warmed ranges are served from cache
+        without touching the network.
+
+        Args:
+            ranges: Iterable of (offset, length) tuples to warm
+
+        Returns:
+            Number of bytes newly requested (0 if everything was cached)
+
+        Raises:
+            ValueError: If file is not opened
+        """
+        return await self.cursor.ohf.cache.prefetch(ranges)
 
     async def close(self) -> None:
         """

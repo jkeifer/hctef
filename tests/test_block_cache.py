@@ -253,3 +253,33 @@ async def test_async_concurrent_reads_dedupe_fetch(tmp_path: Path) -> None:
     # Overlapping concurrent reads share in-flight fetches: blocks 0 and 1
     # are each fetched exactly once.
     assert sorted(log) == [(0, 100), (100, 200)]
+
+
+def test_sync_prefetch_warms_cache_and_coalesces(tmp_path: Path) -> None:
+    log: FetchLog = []
+    cache = make_cache(tmp_path, log)
+    # Two adjacent ranges plus one overlapping: one coalesced request
+    fetched = cache.prefetch([(0, 100), (100, 100), (50, 100)])
+    assert fetched == 200
+    assert log == [(0, 200)]
+
+    # Reads inside the warmed span are served from cache
+    assert cache.read(0, 150) == CONTENT[:150]
+    assert log == [(0, 200)]
+
+    # Prefetching already-cached ranges is a no-op
+    assert cache.prefetch([(0, 200)]) == 0
+    assert log == [(0, 200)]
+
+
+def test_sync_prefetch_clamps_and_disjoint_ranges(tmp_path: Path) -> None:
+    log: FetchLog = []
+    cache = make_cache(tmp_path, log)
+    # Block 0, plus the final short block via a range far past EOF
+    fetched = cache.prefetch([(0, 10), (1040, 1000)])
+    assert fetched == 150  # 100-byte block 0 + 50-byte final block 10
+    assert sorted(log) == [(0, 100), (1000, 1050)]
+
+    # Warmed tail read is served from cache
+    assert cache.read(1040, 1050) == CONTENT[1040:1050]
+    assert sorted(log) == [(0, 100), (1000, 1050)]
