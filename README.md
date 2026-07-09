@@ -332,9 +332,10 @@ breaking change:
   typically a missing `Access-Control-Expose-Headers` on CORS requests)
 - `HctefUrlError`: invalid URL (inherits from `ValueError`)
 
-Transient 5xx/429 responses on range requests are retried a bounded number of
-times with exponential backoff, honoring `Retry-After` (seconds form) when
-present.
+On the async transports (`AsyncHttpFile`), transient 5xx/429 responses on
+range requests are retried a bounded number of times with exponential backoff,
+honoring `Retry-After` (seconds form) when present; the synchronous `HttpFile`
+does not retry.
 
 ```python
 from hctef import HttpFile
