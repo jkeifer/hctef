@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-## [v0.3.2] - 2026-07-09
+## [v0.4.0] - 2026-07-09
 
 No breaking changes.
 
@@ -74,6 +74,6 @@ No breaking changes.
 
 First tracked version!
 
-[unreleased]: https://github.com/jkeifer/hctef/compare/v0.3.2...HEAD
-[v0.3.2]: https://github.com/jkeifer/hctef/releases/tag/v0.3.2
+[unreleased]: https://github.com/jkeifer/hctef/compare/v0.4.0...HEAD
+[v0.4.0]: https://github.com/jkeifer/hctef/releases/tag/v0.4.0
 [v0.3.1]: https://github.com/jkeifer/hctef/releases/tag/v0.3.1
