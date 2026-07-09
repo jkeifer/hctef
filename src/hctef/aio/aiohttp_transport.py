@@ -11,25 +11,23 @@ except ImportError:
 
 from hctef.exceptions import HctefNetworkError, RangeRequestsUnsupportedError
 
-from .transport import RemoteFileInfo
+from .transport import (
+    RETRYABLE_STATUSES,
+    RemoteFileInfo,
+    RetryableFetchError,
+    fetch_with_retries,
+    parse_retry_after,
+)
 
 # Connection-level failures that surface when reusing a pooled keep-alive
 # connection the server has since closed (e.g. S3 idle timeout), or when a
-# transfer is cut off mid-body. Range GETs are idempotent, so one retry is
+# transfer is cut off mid-body. Range GETs are idempotent, so retrying is
 # safe: aiohttp discards the dead connection and the retry opens a fresh one.
 _RETRYABLE_ERRORS = (
     aiohttp.ServerDisconnectedError,
     aiohttp.ClientOSError,
     aiohttp.ClientPayloadError,
 )
-
-# Transient server-side failures (e.g. S3 500/503 SlowDown) also worth one
-# retry before giving up.
-_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
-
-
-class _RetryableStatusError(Exception):
-    """Internal: a response status from _RETRYABLE_STATUSES."""
 
 
 class AiohttpTransport:
@@ -99,6 +97,9 @@ class AiohttpTransport:
         """
         Fetch the byte range [start, end) using the aiohttp session.
 
+        Transient failures (connection drops, 5xx, 429) are retried with
+        backoff, honoring Retry-After when present.
+
         Args:
             url: URL to fetch from
             start: Start byte position (inclusive)
@@ -108,15 +109,20 @@ class AiohttpTransport:
             Bytes fetched from the range
 
         Raises:
-            HctefNetworkError: If the range request fails or the server does
-                not respond with 206 Partial Content
+            RangeRequestsUnsupportedError: If the server ignored the Range
+                header (responded 200)
+            HctefNetworkError: If the range request fails after retries
         """
         headers = {'Range': f'bytes={start}-{end - 1}'}
-        try:
+
+        async def attempt() -> bytes:
             try:
                 return await self._get_range(url, headers, start, end)
-            except (*_RETRYABLE_ERRORS, _RetryableStatusError):
-                return await self._get_range(url, headers, start, end)
+            except _RETRYABLE_ERRORS as e:
+                raise RetryableFetchError(repr(e)) from e
+
+        try:
+            return await fetch_with_retries(attempt)
         except (RuntimeError, HctefNetworkError):
             raise
         except Exception as e:
@@ -132,8 +138,13 @@ class AiohttpTransport:
         end: int,
     ) -> bytes:
         async with self._session.get(url, headers=headers) as response:
-            if response.status in _RETRYABLE_STATUSES:
-                raise _RetryableStatusError(f'HTTP {response.status}')
+            if response.status in RETRYABLE_STATUSES:
+                raise RetryableFetchError(
+                    f'HTTP {response.status}',
+                    retry_after=parse_retry_after(
+                        response.headers.get('Retry-After'),
+                    ),
+                )
             if response.status == 200:
                 # The server ignored the Range header; its full body must
                 # never be cached as if it were the slice.

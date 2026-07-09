@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from hctef.exceptions import HctefNetworkError, RangeRequestsUnsupportedError
 
-from .transport import RemoteFileInfo
+from .transport import (
+    RETRYABLE_STATUSES,
+    RemoteFileInfo,
+    RetryableFetchError,
+    fetch_with_retries,
+    parse_retry_after,
+)
 
 _CORS_HINT = (
     'if this is a cross-origin request in a browser, the server must expose '
@@ -108,6 +114,11 @@ class PyfetchTransport:
         """
         Fetch the byte range [start, end) using the browser fetch API.
 
+        Transient failures are retried with backoff, honoring Retry-After
+        when visible. Raw fetch failures are retried too: browsers mask
+        CORS-less error responses (e.g. a 500 without CORS headers) as
+        generic fetch failures, and this range GET is idempotent.
+
         Args:
             url: URL to fetch from
             start: Start byte position (inclusive)
@@ -117,15 +128,27 @@ class PyfetchTransport:
             Bytes fetched from the range
 
         Raises:
-            HctefNetworkError: If range request fails or the server does
-                not respond with 206 Partial Content
+            RangeRequestsUnsupportedError: If the server ignored the Range
+                header (responded 200)
+            HctefNetworkError: If the range request fails after retries
         """
         self._check_open()
-        try:
-            response = await self._pyfetch(
-                url,
-                headers={'Range': f'bytes={start}-{end - 1}'},
-            )
+
+        async def attempt() -> bytes:
+            try:
+                response = await self._pyfetch(
+                    url,
+                    headers={'Range': f'bytes={start}-{end - 1}'},
+                )
+            except Exception as e:
+                raise RetryableFetchError(repr(e)) from e
+
+            if response.status in RETRYABLE_STATUSES:
+                headers = {k.lower(): v for k, v in response.headers.items()}
+                raise RetryableFetchError(
+                    f'HTTP {response.status}',
+                    retry_after=parse_retry_after(headers.get('retry-after')),
+                )
             if response.status == 200:
                 raise RangeRequestsUnsupportedError(
                     f'Server ignored the Range header fetching bytes '
@@ -138,6 +161,9 @@ class PyfetchTransport:
                     f'{start}-{end} from {url}, got {response.status}',
                 )
             return bytes(await response.bytes())
+
+        try:
+            return await fetch_with_retries(attempt)
         except (RuntimeError, HctefNetworkError):
             raise
         except Exception as e:

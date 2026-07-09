@@ -8,6 +8,8 @@ from typing import Any
 import aiohttp
 import pytest
 
+import hctef.aio.transport as transport_mod
+
 from hctef.aio import AsyncHttpFile
 from hctef.aio.aiohttp_transport import AiohttpTransport
 from hctef.aio.pyfetch_transport import PyfetchTransport
@@ -276,6 +278,11 @@ def test_unknown_transport_name() -> None:
         create_transport('carrier-pigeon')  # type: ignore[arg-type]
 
 
+@pytest.fixture
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transport_mod, 'RETRY_BACKOFF_SECONDS', 0.0)
+
+
 # -- aiohttp transport retry ---------------------------------------------------
 
 
@@ -342,9 +349,13 @@ async def _scripted_transport(
         pytest.param(aiohttp.ClientOSError(), id='conn-reset'),
         pytest.param(aiohttp.ClientPayloadError(), id='truncated-body'),
         pytest.param(_FakeAiohttpResponse(503), id='slowdown-503'),
+        pytest.param(_FakeAiohttpResponse(429), id='too-many-requests'),
     ],
 )
-async def test_aiohttp_fetch_range_retries_once(failure: Outcome) -> None:
+async def test_aiohttp_fetch_range_retries(
+    failure: Outcome,
+    no_backoff: None,
+) -> None:
     transport, session = await _scripted_transport(
         failure,
         _FakeAiohttpResponse(206, DATA),
@@ -363,12 +374,13 @@ async def test_aiohttp_fetch_range_retries_once(failure: Outcome) -> None:
 )
 async def test_aiohttp_fetch_range_persistent_failure_fails(
     failure: Outcome,
+    no_backoff: None,
 ) -> None:
-    transport, session = await _scripted_transport(failure, failure)
+    transport, session = await _scripted_transport(failure, failure, failure)
     with pytest.raises(HctefNetworkError, match='Failed to fetch'):
         await transport.fetch_range(URL, 10, 20)
-    # exactly one retry, no runaway loop
-    assert len(session.requests) == 2
+    # bounded attempts, no runaway loop
+    assert len(session.requests) == transport_mod.RETRY_ATTEMPTS
 
 
 @pytest.mark.asyncio
@@ -420,6 +432,32 @@ async def test_aiohttp_probe_no_range_support_typed() -> None:
     assert excinfo.value.reason == 'no-range-support'
 
 
+@pytest.mark.asyncio
+async def test_retry_honors_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(transport_mod.asyncio, 'sleep', fake_sleep)
+    transport, _ = await _scripted_transport(
+        _FakeAiohttpResponse(429, headers={'Retry-After': '2'}),
+        _FakeAiohttpResponse(206, DATA),
+    )
+    assert await transport.fetch_range(URL, 10, 20) == DATA
+    assert sleeps == [2.0]
+
+
+def test_parse_retry_after() -> None:
+    assert transport_mod.parse_retry_after('2') == 2.0
+    assert transport_mod.parse_retry_after('0') == 0.0
+    assert transport_mod.parse_retry_after(None) is None
+    # HTTP-date form is unsupported: fall back to backoff
+    assert transport_mod.parse_retry_after('Wed, 21 Oct 2015 07:28:00 GMT') is None
+
+
 # -- pyfetch transport behavior ----------------------------------------------
 
 
@@ -459,6 +497,72 @@ async def test_pyfetch_fetch_range_non_206(
     with pytest.raises(RangeRequestsUnsupportedError) as excinfo:
         await transport.fetch_range(URL, 0, 10)
     assert excinfo.value.reason == 'no-range-support'
+
+
+@pytest.mark.asyncio
+async def test_pyfetch_fetch_range_retries_500(
+    monkeypatch: pytest.MonkeyPatch,
+    no_backoff: None,
+) -> None:
+    calls: list[int] = []
+
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(1)
+        if len(calls) == 1:
+            return FakeResponse(500, {})
+        return FakeResponse(
+            206,
+            {'Content-Range': f'bytes 10-19/{len(DATA)}'},
+            DATA[10:20],
+        )
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    assert await transport.fetch_range(URL, 10, 20) == DATA[10:20]
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pyfetch_fetch_range_retries_masked_cors_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    no_backoff: None,
+) -> None:
+    # Browsers mask CORS-less 5xx responses as generic fetch failures;
+    # those must be retried, not treated as fatal on the first try.
+    calls: list[int] = []
+
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(1)
+        if len(calls) < 3:
+            raise OSError('TypeError: Failed to fetch')
+        return FakeResponse(
+            206,
+            {'Content-Range': f'bytes 10-19/{len(DATA)}'},
+            DATA[10:20],
+        )
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    assert await transport.fetch_range(URL, 10, 20) == DATA[10:20]
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_pyfetch_fetch_range_persistent_500_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    no_backoff: None,
+) -> None:
+    calls: list[int] = []
+
+    async def pyfetch(url: str, **kwargs: Any) -> FakeResponse:
+        calls.append(1)
+        return FakeResponse(500, {})
+
+    _install_fake_pyodide(monkeypatch, pyfetch)
+    transport = create_transport('pyfetch')
+    with pytest.raises(HctefNetworkError, match='Failed to fetch'):
+        await transport.fetch_range(URL, 10, 20)
+    assert len(calls) == transport_mod.RETRY_ATTEMPTS
 
 
 @pytest.mark.asyncio
