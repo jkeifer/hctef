@@ -1,3 +1,9 @@
+from .exceptions import (
+    HctefError,
+    HctefNetworkError,
+    HctefUrlError,
+    RangeRequestsUnsupportedError,
+)
 from .http_file import HttpFile
 
 try:
@@ -7,7 +13,11 @@ except ImportError:
     __version_tuple__ = ('0', '0', '0')
 
 __all__: list[str] = [
+    'HctefError',
+    'HctefNetworkError',
+    'HctefUrlError',
     'HttpFile',
+    'RangeRequestsUnsupportedError',
     '__version__',
     '__version_tuple__',
 ]

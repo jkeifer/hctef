@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import time
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 
 from .exceptions import HctefNetworkError
@@ -182,7 +182,7 @@ class _BlockStore:
                 runs.append((index, index))
         return runs
 
-    def _missing_blocks(self, indices: range) -> list[int]:
+    def _missing_blocks(self, indices: Iterable[int]) -> list[int]:
         return [i for i in indices if not self._block_path(i).exists()]
 
     def _check_fetched(self, start: int, end: int, data: bytes) -> bytes:
@@ -328,16 +328,40 @@ class BlockCache(_BlockStore):
             return b''
 
         indices = self._block_indices(start, end)
+        self._ensure_blocks(indices)
+        self._touch(indices)
+        return self._assemble(start, end)
+
+    def prefetch(self, ranges: Iterable[tuple[int, int]]) -> int:
+        """
+        Warm the cache for every (offset, length) range given.
+
+        Block indices across all ranges are deduplicated and coalesced, so
+        adjacent and overlapping ranges collapse into as few requests as
+        possible. Ranges are clamped to the file size.
+
+        Returns:
+            Number of bytes newly requested (0 when everything was cached)
+        """
+        indices: set[int] = set()
+        for offset, length in ranges:
+            start = max(offset, 0)
+            end = min(offset + length, self.file_size)
+            indices.update(self._block_indices(start, end))
+        return self._ensure_blocks(sorted(indices))
+
+    def _ensure_blocks(self, indices: Sequence[int]) -> int:
+        """Fetch any missing blocks; returns bytes newly requested."""
         protected: set[int] = set()
+        requested = 0
         for first, last in self._coalesce(self._missing_blocks(indices)):
             fetch_start, fetch_end = self._run_byte_range(first, last)
             protected.update(range(first, last + 1))
+            requested += fetch_end - fetch_start
             data = self._check_fetched(
                 fetch_start,
                 fetch_end,
                 self._fetch(fetch_start, fetch_end),
             )
             self._write_run(first, data, protected)
-
-        self._touch(indices)
-        return self._assemble(start, end)
+        return requested
