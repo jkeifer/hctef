@@ -21,8 +21,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.4.0] - 2026-07-09
 
-No breaking changes.
-
 ### Added
 
 - `RangeRequestsUnsupportedError`, a subclass of `HctefNetworkError`, raised
@@ -63,12 +61,6 @@ No breaking changes.
 - The pyfetch transport's `probe()` no longer misreports HTTP 4xx/5xx error
   responses as missing range support; they now raise a plain
   `HctefNetworkError` naming the status.
-
-### Deprecated
-
-### Removed
-
-### Security
 
 ## [v0.3.1] - 2026-07-06
 
